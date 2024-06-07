@@ -1,7 +1,14 @@
-FROM python:3.11
-
-RUN pip install arq httpx "weaviate-client==3.*"
+FROM golang:latest
 
 WORKDIR /app
-COPY *.py ./
-COPY wrapper_classes wrapper_classes
+
+COPY go.mod go.sum ./
+
+RUN go mod download
+
+COPY data_loaders data_loaders
+COPY manager.go .
+
+RUN go build -o manager .
+
+CMD ["./manager", "--loader=map_descrip"]

@@ -1,12 +1,15 @@
-package wrapper_classes
+package data_loaders
 
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"github.com/weaviate/weaviate-go-client/v4/weaviate"
+	"github.com/weaviate/weaviate-go-client/v4/weaviate/auth"
 	"github.com/weaviate/weaviate-go-client/v4/weaviate/graphql"
 	"github.com/weaviate/weaviate/entities/models"
 	"log"
+	"os"
 )
 
 type ParagraphData struct {
@@ -20,22 +23,32 @@ type GraphQLData struct {
 	Paragraphs []ParagraphData `json:"Paragraph"`
 }
 
-func GetBatchWithCursor(client *weaviate.Client, batchSize int, cursor string) (*models.GraphQLResponse, error) {
-	get := client.GraphQL().Get().
-		WithClassName("Paragraph").
-		WithFields(graphql.Field{Name: "_additional { id }"}, graphql.Field{Name: "topic_list"}).
-		WithLimit(batchSize)
-
-	if cursor != "" {
-		return get.WithAfter(cursor).Do(context.Background())
-	}
-	return get.Do(context.Background())
+type WeaviateLoader struct {
+	weaviate_client *weaviate.Client
+	cursor          string
 }
 
-func GenerateFilteredBatch(client *weaviate.Client, batchSize int, cursor *string) ([]string, bool) {
+func (loader *WeaviateLoader) InitValues() {
+	// connect to weaviate
+	host := fmt.Sprintf("%v:%v", os.Getenv("WEAVIATE_HOST"), os.Getenv("WEAVIATE_PORT"))
+	cfg := weaviate.Config{
+		Host:       host,
+		Scheme:     "http",
+		AuthConfig: auth.ApiKey{Value: os.Getenv("WEAVIATE_API_KEY")},
+		Headers:    nil,
+	}
+
+	var err error
+	loader.weaviate_client, err = weaviate.NewClient(cfg)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func (loader *WeaviateLoader) GetBatch(batchSize int) ([]string, bool) {
 	var batch []string
 	for {
-		response, err := GetBatchWithCursor(client, batchSize, *cursor)
+		response, err := getBatchWithCursor(loader.weaviate_client, batchSize, loader.cursor)
 		if err != nil || response.Errors != nil {
 			errors, _ := json.Marshal(response.Errors)
 			log.Fatalf("Error fetching data or GraphQL errors: %v", string(errors))
@@ -62,7 +75,7 @@ func GenerateFilteredBatch(client *weaviate.Client, batchSize int, cursor *strin
 		}
 
 		// update cursor
-		*cursor = data.Paragraphs[len(data.Paragraphs)-1].Additional.ID
+		loader.cursor = data.Paragraphs[len(data.Paragraphs)-1].Additional.ID
 
 		// check if batch is full or if there are no more paragraphs left in weaviate
 		if len(data.Paragraphs) < batchSize {
@@ -72,4 +85,16 @@ func GenerateFilteredBatch(client *weaviate.Client, batchSize int, cursor *strin
 			return batch, false
 		}
 	}
+}
+
+func getBatchWithCursor(client *weaviate.Client, batchSize int, cursor string) (*models.GraphQLResponse, error) {
+	get := client.GraphQL().Get().
+		WithClassName("Paragraph").
+		WithFields(graphql.Field{Name: "_additional { id }"}, graphql.Field{Name: "topic_list"}).
+		WithLimit(batchSize)
+
+	if cursor != "" {
+		return get.WithAfter(cursor).Do(context.Background())
+	}
+	return get.Do(context.Background())
 }

@@ -3,69 +3,137 @@ package main
 import (
 	"bufio"
 	"encoding/json"
-	"fmt"
-	"job_manager/wrapper_classes"
+	"flag"
+	"job_manager/data_loaders"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+)
 
-	"github.com/joho/godotenv"
-	"github.com/weaviate/weaviate-go-client/v4/weaviate"
-	"github.com/weaviate/weaviate-go-client/v4/weaviate/auth"
+type JobType string
+
+const (
+	Wait        JobType = "wait"
+	BatchJob    JobType = "batch"
+	OnDemandJob JobType = "on_demand"
 )
 
 type Context struct {
-	wg         sync.WaitGroup
-	statusLock sync.Mutex
-	jobMap     map[uint64]Job
-	jobQueue   chan Job
-	jobCounter atomic.Uint64
+	wg            sync.WaitGroup
+	statusLock    sync.Mutex
+	jobMap        map[uint64]Job
+	jobQueue      chan Job
+	jobCounter    atomic.Uint64
+	healthTimeout int
+	metadata      JobMetadata
+}
+
+type JobMetadata struct {
+	PipelineId int
+	RunID      int
 }
 
 type Job struct {
-	ID          uint64
-	WeaviateIDs []string
-	startTime   time.Time
-	healthTime  time.Time
-	// status      Status
+	JobType       JobType
+	ID            uint64
+	JobData       []string
+	Metadata      JobMetadata
+	HealthTimeout int
+	returnChan    chan map[string]interface{}
+	startTime     time.Time
+	healthTime    time.Time
 }
 
 type JobArgs struct {
-	ID uint64
+	ID     uint64
+	Result map[string]interface{}
+}
+
+type JobRequest struct {
+	JobData []string
+}
+
+type DataLoader interface {
+	InitValues()
+	GetBatch(int) ([]string, bool)
 }
 
 var ctx Context
 
 func main() {
-	groupSize := 2
-	miniBatchSize := 10
-	healthInterval := 2
-	healthTimeout := 10
+	groupSize, _ := strconv.Atoi(os.Getenv("GROUP_SIZE"))
+	miniBatchSize, _ := strconv.Atoi(os.Getenv("MINI_BATCH_SIZE"))
+	healthInterval, _ := strconv.Atoi(os.Getenv("HEALTH_INTERVAL"))
+	healthTimeout, _ := strconv.Atoi(os.Getenv("HEALTH_TIMEOUT"))
+	pipelineId, _ := strconv.Atoi(os.Getenv("PIPELINE_ID"))
+	runId, _ := strconv.Atoi(os.Getenv("RUN_ID"))
 
 	ctx = Context{
-		jobMap:   make(map[uint64]Job),
-		jobQueue: make(chan Job, groupSize),
+		jobMap:        make(map[uint64]Job),
+		jobQueue:      make(chan Job, groupSize),
+		healthTimeout: healthTimeout,
+		metadata:      JobMetadata{PipelineId: pipelineId, RunID: runId},
 	}
-	go QueueJobs(groupSize, miniBatchSize, "")
+
+	loader_flag := flag.String("loader", "", "Specify the data loader for the manager. Options are \"weaviate\", \"map_descrip\". Default is none (on demand queuing).")
+	flag.Parse()
+	var loader DataLoader
+	switch *loader_flag {
+	case "weaviate":
+		loader = &data_loaders.WeaviateLoader{}
+	case "map_descrip":
+		loader = &data_loaders.DescriptionsLoader{}
+	}
+	if loader != nil {
+		loader.InitValues()
+		go QueueJobs(groupSize, miniBatchSize, loader)
+	}
+
 	go HealthRoutine(time.Duration(healthInterval), time.Duration(healthTimeout))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /request_job", RequestJob)
 	mux.HandleFunc("POST /finish_job", FinishJob)
 	mux.HandleFunc("POST /health_check", HealthCheck)
-	log.Println("Listening on http://localhost:8080/")
-	log.Fatal(http.ListenAndServe(":8080", mux))
+	mux.HandleFunc("POST /submit_job", SubmitJob)
+	log.Println("Listening on http://localhost:8000/")
+	log.Fatal(http.ListenAndServe(":8000", mux))
 }
 
-func FinishJob(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method is not supported.", http.StatusMethodNotAllowed)
+func SubmitJob(w http.ResponseWriter, r *http.Request) {
+	var job JobRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&job); err != nil {
+		http.Error(w, "Error parsing JSON from request body\n"+err.Error(), http.StatusBadRequest)
 		return
 	}
 
+	// add new job to channel
+	id := ctx.jobCounter.Add(1)
+	returnChan := make(chan map[string]interface{})
+	ctx.jobQueue <- Job{
+		ID:         id,
+		JobType:    OnDemandJob,
+		JobData:    job.JobData,
+		returnChan: returnChan,
+	}
+	log.Printf("Accepted request to queued job of %v paragraphs", len(job.JobData))
+
+	result := <-returnChan
+
+	// output result as json
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(result); err != nil {
+		http.Error(w, "Error writing JSON response\n"+err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func FinishJob(w http.ResponseWriter, r *http.Request) {
 	var args JobArgs
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
@@ -79,18 +147,18 @@ func FinishJob(w http.ResponseWriter, r *http.Request) {
 	defer ctx.statusLock.Unlock()
 	job, ok := ctx.jobMap[args.ID]
 	if ok {
+		if job.JobType == OnDemandJob {
+			job.returnChan <- args.Result
+		} else {
+			ctx.wg.Done()
+		}
+
 		log.Printf("Job %v finished [%.2f seconds].", args.ID, time.Since(job.startTime).Seconds())
 		delete(ctx.jobMap, args.ID)
-		ctx.wg.Done()
 	}
 }
 
 func HealthCheck(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method is not supported.", http.StatusMethodNotAllowed)
-		return
-	}
-
 	var args JobArgs
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
@@ -107,33 +175,38 @@ func HealthCheck(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Job %v is healthy.", args.ID)
 		job.healthTime = time.Now()
 		ctx.jobMap[args.ID] = job
-		ctx.wg.Done()
 	}
 }
 
 func RequestJob(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method is not supported.", http.StatusMethodNotAllowed)
+	// pop new job from channel, tell worker to wait if no jobs are available
+	var job Job
+	select {
+	case job = <-ctx.jobQueue:
+	case <-time.After(1 * time.Second):
+		job.JobType = Wait
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(job); err != nil {
+			http.Error(w, "Error writing JSON response\n"+err.Error(), http.StatusInternalServerError)
+		}
 		return
 	}
 
-	// pop new job from queue
-	job := <-ctx.jobQueue
+	// update state of job
 	currentTime := time.Now()
 	job.healthTime = currentTime
 	job.startTime = currentTime
-
+	job.HealthTimeout = ctx.healthTimeout / 10
 	log.Printf("Job %v requested.\n", job.ID)
 
 	ctx.statusLock.Lock()
 	defer ctx.statusLock.Unlock()
 	ctx.jobMap[job.ID] = job
 
-	// output job as json (only ID and WeaviateIDs fields will be encoded)
+	// output job as json
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(job); err != nil {
 		http.Error(w, "Error writing JSON response\n"+err.Error(), http.StatusInternalServerError)
-		return
 	}
 }
 
@@ -156,52 +229,37 @@ func HealthRoutine(healthInterval time.Duration, healthTimeout time.Duration) {
 	}
 }
 
-func QueueJobs(groupSize int, batchSize int, cursor string) {
-	// load environment variables
-	env, err := godotenv.Read(".env")
-	if err != nil {
-		panic(err)
-	}
-	ClearFile("ids.txt")
-	ClearFile("cursor.txt")
-
-	// connect to weaviate
-	host := fmt.Sprintf("%v:%v", env["WEAVIATE_HOST"], env["WEAVIATE_PORT"])
-	cfg := weaviate.Config{
-		Host:       host,
-		Scheme:     "http",
-		AuthConfig: auth.ApiKey{Value: env["WEAVIATE_API_KEY"]},
-		Headers:    nil,
-	}
-	weaviate_client, err := weaviate.NewClient(cfg)
-	if err != nil {
-		panic(err)
-	}
-
+func QueueJobs(groupSize int, batchSize int, dataLoader DataLoader) {
 	// generate jobs in groups and wait for group to finish before moving on to next group
 	groupCount := 1
+	ClearFile("processed_data.txt") // may want to adjust how to keep track of processed data (ie saving only offsets)
 	for {
 		groupStart := time.Now()
-		var idList []string
+		var dataList []string
 		for range groupSize {
-			miniBatch, end := wrapper_classes.GenerateFilteredBatch(weaviate_client, batchSize, &cursor)
+			miniBatch, end := dataLoader.GetBatch(batchSize)
 			id := ctx.jobCounter.Add(1)
 			ctx.jobQueue <- Job{
-				ID:          id,
-				WeaviateIDs: miniBatch,
+				JobType: BatchJob,
+				ID:      id,
+				JobData: miniBatch,
 			}
-			idList = append(idList, miniBatch...)
+
+			dataList = append(dataList, miniBatch...)
 			ctx.wg.Add(1)
 
 			if end {
-				log.Println("Extracted all ids from Weaviate.")
+				log.Println("Queued all jobs.")
+
+				ctx.wg.Wait()
+				log.Println("Finished all jobs.")
 				return
 			}
 		}
+
 		ctx.wg.Wait()
 		log.Printf("Finished processing group %v [avg %.2f seconds per paragraph]", groupCount, time.Since(groupStart).Seconds()/float64(groupSize*batchSize))
-		SaveToFile("ids.txt", idList)
-		SaveToFile("cursor.txt", []string{cursor})
+		SaveToFile("processed_data.txt", dataList)
 		groupCount++
 	}
 }
@@ -215,8 +273,7 @@ func ClearFile(filename string) {
 }
 
 func SaveToFile(filename string, list []string) {
-	// append instead of truncate
-	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644) // append instead of truncate
 	if err != nil {
 		log.Fatalf("Failed to create file: %s", err)
 	}
