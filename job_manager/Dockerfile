@@ -11,4 +11,4 @@ COPY manager.go .
 
 RUN go build -o manager .
 
-CMD ["./manager", "--loader=map_descrip"]
+ENTRYPOINT ["./manager"]
