@@ -24,15 +24,7 @@ We describe each of the components in detail here.
 
 ## Job Manager
 
-The job manager uses a Redis job queue to communicate tasks to workers. The manager pulls paragraph ids from Weaviate which is sent to the workers. 
-
-You can build and start the Redis server along with the manager like so:
-```
-$ cd job_manager
-$ docker-compose up --build
-```
-
-Be sure to have a `.env` file to specify configurations for the Redis server, Weaviate, etc. 
+See `job_manager/README.md` for details on how to build and run the job manager.
 
 ## Worker Containers
 
